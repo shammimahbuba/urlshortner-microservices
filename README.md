@@ -1,298 +1,796 @@
-# URL Shortener - Microservice Architecture Demo
+# URL Shortener — Multi-Service Application on Kubernetes
 
-A production-ready microservice-based URL shortener demonstrating proper service separation with four independent services: Go for high-performance redirects, Python for analytics and dashboard, Node.js for URL metadata enrichment, and Redis for event-driven communication and caching.
+A microservice-based URL shortener deployed with Docker, Kubernetes (Minikube), Ingress NGINX, Horizontal Pod Autoscaler, Prometheus + Grafana monitoring, k6 load testing and GitHub Actions CI.
+
+| | |
+|---|---|
+| **Submitted by** | Mahbuba Sultana Shammi |
+| **Batch** | Ostad Batch-10 |
+| **Course** | DevOps |
+| **Assignment** | Deployment of a Multi-Service URL Shortener Application Using Kubernetes & CI/CD |
+| **Submission Date** | July 2026 |
+
+---
+
+## Table of Contents
+
+1. [Architecture](#architecture)
+2. [Technology Stack](#technology-stack)
+3. [Repository Layout](#repository-layout)
+4. [Prerequisites](#prerequisites)
+5. [Deployment — Part 1: Docker Compose (local)](#deployment--part-1-docker-compose-local)
+6. [Deployment — Part 2: Kubernetes on Minikube](#deployment--part-2-kubernetes-on-minikube)
+7. [Deployment — Part 3: Ingress](#deployment--part-3-ingress)
+8. [Deployment — Part 4: Horizontal Pod Autoscaler](#deployment--part-4-horizontal-pod-autoscaler)
+9. [Deployment — Part 5: Monitoring with Prometheus & Grafana](#deployment--part-5-monitoring-with-prometheus--grafana)
+10. [Deployment — Part 6: Load Testing with k6](#deployment--part-6-load-testing-with-k6)
+11. [CI/CD with GitHub Actions](#cicd-with-github-actions)
+12. [Verification Checklist](#verification-checklist)
+13. [Cleanup / Teardown](#cleanup--teardown)
+14. [Troubleshooting](#troubleshooting)
+15. [API Reference](#api-reference)
+16. [Database Schema](#database-schema)
+17. [Learning Outcomes](#learning-outcomes)
+18. [Credits & License](#credits--license)
+
+---
 
 ## Architecture
 
-This project demonstrates a realistic microservice architecture where different services handle their specific responsibilities:
+Three independent application services plus Redis. Each service owns its own SQLite database — no shared database between services.
+
+```
+                          Ingress NGINX (urlshortener.local)
+                                       |
+              /python          /go             /node
+                 |              |                |
+        +--------v-----+  +-----v------+  +------v-------+
+        |   Python     |  |    Go      |  |   Node.js    |
+        |  Dashboard   |  | Shortener  |  |  Metadata    |
+        |  Flask :5000 |  | Gin :8000  |  | Express:3000 |
+        +------+-------+  +-----+------+  +------+-------+
+               |                |                |
+            python.db         go.db           node.db
+               |                |
+               +-------+--------+
+                       |
+                 +-----v------+
+                 |   Redis    |   Pub/Sub (click_events) + cache
+                 |   :6379    |   PVC-backed persistence
+                 +------------+
+```
 
 ### Services
 
-**Go Service (Port 8000)**
+| Service | Port | Framework | Responsibility |
+|---|---|---|---|
+| **Go Service** | 8000 | Gin | Create short codes, fast redirects, Redis cache + publish click events |
+| **Python Service** | 5000 | Flask | Web dashboard, orchestrates Go + Node calls, subscribes to Redis click events, analytics |
+| **Node.js Service** | 3000 | Express | Fetch page title/description/favicon (Axios + Cheerio), serve metadata REST API |
+| **Redis** | 6379 | redis:8-alpine | Message broker (Pub/Sub) and cache layer |
 
-- **Purpose**: Fast URL redirection and creation
-- **Database**: `go.db` (SQLite)
-- **Responsibilities**:
-  - Generate and store short codes
-  - Handle URL redirects with minimal latency
-  - Send click events to Python service asynchronously
-- **Technology**: Go with Gin framework
+### Communication patterns
 
-**Python Service (Port 5000)**
-
-- **Purpose**: Analytics, data aggregation, and user interface
-- **Database**: `python.db` (SQLite)
-- **Responsibilities**:
-  - Provide web dashboard for URL creation
-  - Orchestrate URL creation (call Go) and metadata fetching (call Node.js)
-  - Subscribe to Redis click events channel
-  - Collect and aggregate click events
-  - Display analytics and statistics with metadata
-  - Generate visualizations
-  - HTTP fallback endpoint for events
-- **Technology**: Python with Flask, redis-py
-
-**Node.js Service (Port 3000)**
-
-- **Purpose**: URL metadata enrichment
-- **Database**: `node.db` (SQLite)
-- **Responsibilities**:
-  - Fetch page titles, descriptions, and favicons from URLs
-  - Parse HTML content with Cheerio
-  - Store and serve metadata via REST API
-- **Technology**: Node.js with Express, Axios, Cheerio
-
-### Microservice Communication
-
-**URL Creation (Synchronous):**
+**URL creation (synchronous):**
 
 ```
 User → Python Dashboard
+         ├→ Go Service    → create short URL → go.db
+         └→ Node Service  → fetch metadata   → node.db
          ↓
-         ├→ Go Service → Create Short URL → go.db
-         └→ Node.js Service → Fetch Metadata → node.db
-         ↓
-    Display URL + Metadata in UI
+    Display short URL + metadata
 ```
 
-**Click Events (Event-Driven with Redis):**
+**Click events (event-driven):**
 
 ```
 User clicks → Go Service
-                ↓
-            1. Check Redis cache
-               ├─ Hit: Instant redirect ⚡
-               └─ Miss: Query DB → Cache in Redis
-                ↓
-            2. Publish to Redis "click_events"
-                ↓
-            Redis Pub/Sub
-                ↓
-            Python subscribes → Process event → python.db
+                1. Check Redis cache (hit = instant redirect, miss = DB → cache)
+                2. Publish to Redis channel "click_events"
+                        ↓
+                Python subscriber → process event → python.db
 ```
 
-**Communication Patterns:**
+- **Python → Go / Node**: HTTP (needs immediate response)
+- **Go → Redis → Python**: Pub/Sub (decoupled, async)
+- **Fallback**: direct HTTP POST to Python if Redis is unavailable (graceful degradation)
 
-- **Python → Go**: HTTP POST (URL creation - needs immediate response)
-- **Python → Node.js**: HTTP POST (metadata fetch - synchronous)
-- **Go → Redis**: Pub/Sub publish (click events - decoupled)
-- **Redis → Python**: Pub/Sub subscribe (click events - async processing)
-- **Go → Redis**: Cache (URL lookups - performance)
-- **Fallback**: HTTP POST if Redis unavailable
-- **No direct database sharing**: Each service owns its data
+---
 
-## Features
+## Technology Stack
 
-- ✅ Create short URLs through web dashboard
-- ✅ **Lightning-fast redirects with Redis caching** ⚡
-- ✅ **Event-driven architecture with Redis Pub/Sub**
-- ✅ **Never lose events** - Redis queues them if Python is down
-- ✅ URL metadata enrichment via Node.js (titles, descriptions, favicons)
-- ✅ Real-time analytics dashboard
-- ✅ Click tracking and history
-- ✅ Visual charts for click patterns
-- ✅ Top URLs by popularity with page info
-- ✅ Recent activity monitoring
-- ✅ Auto-refreshing dashboard (every 5 seconds)
-- ✅ Visual indicators showing Node.js service status
-- ✅ **Graceful degradation** - HTTP fallback if Redis unavailable
+| Technology | Purpose |
+|---|---|
+| Docker | Containerization |
+| Docker Compose | Local multi-service development |
+| Kubernetes | Container orchestration |
+| Minikube | Local Kubernetes cluster |
+| Redis 8 | Cache + Pub/Sub message broker |
+| ConfigMap | Non-sensitive application configuration |
+| Secret | Sensitive configuration |
+| Ingress NGINX | HTTP routing to services |
+| Metrics Server | Resource metrics for HPA |
+| Horizontal Pod Autoscaler | CPU-based auto scaling |
+| Prometheus | Metrics collection |
+| Grafana | Dashboards / visualization |
+| k6 | Load and performance testing |
+| GitHub Actions | CI pipeline |
+
+---
+
+## Repository Layout
+
+```
+urlshortner-microservices/
+├── README.md
+├── docker-compose.yml              # 4 services: redis, go, node, python
+├── loadtest.js                     # k6 load test script
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # GitHub Actions CI (builds all 3 images)
+├── go-service/
+│   ├── Dockerfile
+│   ├── main.go                     # Gin app, Redis cache + publisher
+│   ├── go.mod / go.sum
+│   └── .dockerignore
+├── node-service/
+│   ├── Dockerfile
+│   ├── server.js                   # Express metadata API
+│   ├── package.json
+│   └── .dockerignore
+├── python-service/
+│   ├── Dockerfile
+│   ├── app.py                      # Flask dashboard + Redis subscriber
+│   ├── requirements.txt
+│   ├── .flake8
+│   ├── templates/dashboard.html
+│   └── .dockerignore
+└── kubernetes/
+    ├── namespace.yaml              # namespace: urlshortener
+    ├── configmap.yaml              # urlshortener-config
+    ├── secret.yaml                 # urlshortener-secret
+    ├── redis.yaml                  # PVC + Deployment + Service
+    ├── go-deployment.yaml          # Deployment (2 replicas) + ClusterIP Service
+    ├── node-deployment.yaml        # Deployment + ClusterIP Service
+    ├── python-deployment.yaml      # Deployment + ClusterIP Service
+    ├── ingress.yaml                # urlshortener.local → /go /node /python
+    └── hpa.yaml                    # 3 HPAs (min 1, max 5, CPU 50%)
+```
+
+---
 
 ## Prerequisites
 
-- **Go**: Version 1.24 or higher
-- **Python**: Version 3.14 (or 3.8+)
-- **Node.js**: Version 24.11 or higher (with npm)
-- **Redis**: Version 7 or higher (for local: localhost:6380)
-- **SQLite**: Built-in with Go, Python, and Node.js
-- **Docker & Docker Compose**: For containerized deployment (recommended)
+Install these before starting:
 
-## Installation & Setup
+| Tool | Minimum version | Check |
+|---|---|---|
+| Docker Desktop | 24+ | `docker --version` |
+| Docker Compose | v2 | `docker compose version` |
+| Minikube | 1.32+ | `minikube version` |
+| kubectl | 1.28+ | `kubectl version --client` |
+| Helm | 3.x | `helm version` |
+| k6 | 0.49+ | `k6 version` |
+| Git | any | `git --version` |
 
-### Option 1: Docker (Recommended) 🐳
-
-**Prerequisites:**
-
-- Docker
-- Docker Compose
-
-**Quick Start:**
+Clone the repository:
 
 ```bash
-# Navigate to project
-cd /home/xaadu/codes/urlshortner
-
-# Build and start all services
-docker-compose up --build
-
-# Or run in background
-docker-compose up --build -d
+git clone https://github.com/<your-username>/urlshortner-microservices.git
+cd urlshortner-microservices
 ```
 
-**Access the application:**
-
-- Dashboard: `http://localhost:5000`
-- Go Service: `http://localhost:8000`
-- Node.js Service: `http://localhost:3000`
-
-**Useful Docker Commands:**
-
-```bash
-# View logs
-docker-compose logs -f
-
-# View logs for specific service
-docker-compose logs -f python-service
-
-# Stop all services
-docker-compose down
-
-# Stop and remove volumes (deletes databases)
-docker-compose down -v
-
-# Rebuild after code changes
-docker-compose up --build
-```
-
-**How it works:**
-
-- Each service runs in its own container
-- Services communicate via Docker network using container names
-- Databases persist in Docker volumes
-- All services start together with one command!
+> **Note for Windows users:** all commands below work in PowerShell. Where a command uses `\` for line continuation, use a single line or backtick `` ` `` instead. Multi-line `curl` examples use `curl.exe` on Windows.
 
 ---
 
-### Option 2: Local Development (Without Docker)
+## Deployment — Part 1: Docker Compose (local)
 
-### 1. Clone or navigate to the project
+This is the fastest way to run everything and also the step that **builds the images Kubernetes will use**.
 
-```bash
-cd /home/xaadu/codes/urlshortner
-```
-
-### 2. Setup Go Service
+### 1.1 Build and start
 
 ```bash
-cd go-service
-
-# Download dependencies
-go mod download
-
-# Run the service
-go run main.go
+docker compose up --build -d
 ```
 
-The Go service will start on `http://localhost:8000`
-
-### 3. Setup Python Service
-
-Open a new terminal:
+### 1.2 Verify
 
 ```bash
-cd /home/xaadu/codes/urlshortner/python-service
-
-# Create virtual environment (following user preference)
-python3.14 -m venv venv
-
-# Activate virtual environment
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the service
-python app.py
+docker compose ps
 ```
 
-The Python service will start on `http://localhost:5000`
-
-### 4. Setup Redis (Local Development)
+Expected: `redis`, `go-service`, `node-service`, `python-service` all in `running` state.
 
 ```bash
-# User has Redis running at localhost:6380
-# Services will automatically connect to it
-# No additional setup needed!
+docker compose logs -f            # all services
+docker compose logs -f python-service   # one service
 ```
 
-### 5. Setup Node.js Service
+### 1.3 Access the application
 
-Open a new terminal:
+| Component | URL |
+|---|---|
+| Dashboard (Python) | http://localhost:5000 |
+| Go API | http://localhost:8000 |
+| Node API | http://localhost:3000 |
+
+Smoke test:
 
 ```bash
-cd /home/xaadu/codes/urlshortner/node-service
+# Node health
+curl http://localhost:3000/health
+# → {"status":"healthy"}
 
-# Install dependencies
-npm install
+# Create a short URL through the Go API
+curl -X POST http://localhost:8000/api/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"long_url":"https://github.com"}'
 
-# Run the service
-node server.js
+# Create through the dashboard (orchestrates Go + Node)
+curl -X POST http://localhost:5000/create -d "long_url=https://github.com"
 ```
 
-The Node.js service will start on `http://localhost:3000`
+Open http://localhost:5000 in a browser — the dashboard shows total URLs, total clicks, page titles/favicons fetched by the Node service, and a clicks-over-time chart that refreshes every 5 seconds.
+
+### 1.4 Image names produced
+
+Compose uses the project name `urlshortner-microservices`, so the built images are:
+
+```
+urlshortner-microservices-go-service:latest
+urlshortner-microservices-node-service:latest
+urlshortner-microservices-python-service:latest
+```
+
+These are exactly the image names referenced in the Kubernetes deployments. **Do not rename them** unless you also update `kubernetes/*-deployment.yaml`.
+
+### 1.5 Stop
+
+```bash
+docker compose down        # stop containers
+docker compose down -v     # stop and delete volumes (wipes the databases)
+```
 
 ---
 
-## Usage
+## Deployment — Part 2: Kubernetes on Minikube
 
-### Access the Dashboard
-
-Open your browser and navigate to:
-
-```
-http://localhost:5000
-```
-
-### Create a Short URL
-
-1. Enter a long URL in the input field
-2. Click "Shorten"
-3. Copy the generated short URL
-
-### Test the Redirect
-
-Visit the short URL in your browser:
-
-```
-http://localhost:8000/{short_code}
-```
-
-You'll be redirected to the original URL, and the click will be tracked in the analytics.
-
-### View Analytics
-
-The dashboard automatically shows:
-
-- Total URLs created
-- Total clicks
-- **Page metadata (titles, favicons) fetched by Node.js**
-- Clicks over time (24-hour chart)
-- Top URLs by popularity with page info
-- All created URLs with metadata status indicators
-- Recent click activity
-
-The dashboard refreshes every 5 seconds automatically.
-
-**Visual Indicators:**
-
-- ✅ Green badge "✓ Node.js" = Metadata successfully fetched
-- ❌ Red badge "✗" = Metadata fetch failed
-- Favicon icons displayed next to page titles
-
-## API Endpoints
-
-### Go Service (Port 8000)
-
-**Create Short URL**
+### 2.1 Start the cluster
 
 ```bash
+minikube start --driver=docker --cpus=4 --memory=6144
+minikube status
+```
+
+Enable the required addons:
+
+```bash
+minikube addons enable ingress          # NGINX Ingress Controller
+minikube addons enable metrics-server   # required for HPA
+```
+
+Confirm they came up:
+
+```bash
+kubectl get pods -n ingress-nginx
+kubectl get deployment metrics-server -n kube-system
+```
+
+### 2.2 Load the local images into Minikube
+
+The deployments use `imagePullPolicy: Never`, so images must exist **inside** the Minikube node. Build them first with Compose (Part 1), then load:
+
+```bash
+minikube image load urlshortner-microservices-go-service:latest
+minikube image load urlshortner-microservices-node-service:latest
+minikube image load urlshortner-microservices-python-service:latest
+```
+
+Verify:
+
+```bash
+minikube image ls | grep urlshortner
+```
+
+> **Alternative:** build directly inside the Minikube daemon instead of loading.
+> Linux/macOS: `eval $(minikube docker-env)` then `docker compose build`.
+> PowerShell: `& minikube -p minikube docker-env --shell powershell | Invoke-Expression` then `docker compose build`.
+
+### 2.3 Apply the manifests
+
+Apply in order (namespace first, then config, then workloads):
+
+```bash
+kubectl apply -f kubernetes/namespace.yaml
+kubectl apply -f kubernetes/configmap.yaml
+kubectl apply -f kubernetes/secret.yaml
+kubectl apply -f kubernetes/redis.yaml
+kubectl apply -f kubernetes/go-deployment.yaml
+kubectl apply -f kubernetes/node-deployment.yaml
+kubectl apply -f kubernetes/python-deployment.yaml
+kubectl apply -f kubernetes/ingress.yaml
+kubectl apply -f kubernetes/hpa.yaml
+```
+
+Or apply the whole folder at once:
+
+```bash
+kubectl apply -f kubernetes/
+```
+
+### 2.4 Verify the deployment
+
+```bash
+kubectl get all -n urlshortener
+kubectl get pods -n urlshortener
+kubectl get svc -n urlshortener
+```
+
+Wait until every pod is `Running` and `READY 1/1`:
+
+```bash
+kubectl wait --for=condition=ready pod --all -n urlshortener --timeout=180s
+```
+
+Expected resources:
+
+| Kind | Name | Notes |
+|---|---|---|
+| Deployment | `go-service` | 2 replicas |
+| Deployment | `node-service` | 1 replica |
+| Deployment | `python-service` | 1 replica |
+| Deployment | `redis` | 1 replica, PVC-backed |
+| Service (ClusterIP) | `go-service` | port 8000 |
+| Service (ClusterIP) | `node-service` | port 3000 |
+| Service (ClusterIP) | `python-service` | port 5000 |
+| Service (ClusterIP) | `redis-service` | port 6379 |
+| PVC | `redis-pvc` | 1Gi |
+
+### 2.5 Configuration: ConfigMap and Secret
+
+Non-sensitive configuration lives in the ConfigMap `urlshortener-config`:
+
+```bash
+kubectl get configmap urlshortener-config -n urlshortener -o yaml
+```
+
+| Key | Value |
+|---|---|
+| `GO_SERVICE_URL` | `http://go-service:8000` |
+| `NODE_SERVICE_URL` | `http://node-service:3000` |
+| `PYTHON_SERVICE_URL` | `http://python-service:5000` |
+| `REDIS_HOST` | `redis-service` |
+| `REDIS_PORT` | `6379` |
+| `APP_ENV` | `production` |
+
+Sensitive values live in the Secret `urlshortener-secret` (`REDIS_PASSWORD`), kept out of the ConfigMap and out of the container images:
+
+```bash
+kubectl get secret urlshortener-secret -n urlshortener
+kubectl describe secret urlshortener-secret -n urlshortener
+```
+
+> The Secret is declared and available for injection. Redis in this cluster currently runs without `requirepass`, so the deployments read Redis connection details from plain env vars / the ConfigMap. To wire the Secret in, add to a container spec:
+>
+> ```yaml
+> env:
+>   - name: REDIS_PASSWORD
+>     valueFrom:
+>       secretKeyRef:
+>         name: urlshortener-secret
+>         key: REDIS_PASSWORD
+> ```
+>
+> and start Redis with `--requirepass $(REDIS_PASSWORD)`. Also change the placeholder value before using this anywhere real.
+
+### 2.6 Quick in-cluster test (before Ingress)
+
+```bash
+kubectl port-forward -n urlshortener svc/python-service 5000:5000
+# browser → http://localhost:5000
+```
+
+---
+
+## Deployment — Part 3: Ingress
+
+The Ingress `urlshortener-ingress` routes one host to all three services using path prefixes and a rewrite rule (`rewrite-target: /$2`), so `/node/health` reaches the Node service as `/health`.
+
+| Path | Backend | Port |
+|---|---|---|
+| `/go/...` | `go-service` | 8000 |
+| `/node/...` | `node-service` | 3000 |
+| `/python/...` | `python-service` | 5000 |
+
+### 3.1 Verify the Ingress
+
+```bash
+kubectl get ingress -n urlshortener
+kubectl describe ingress urlshortener-ingress -n urlshortener
+```
+
+### 3.2 Map the hostname
+
+Get the Minikube IP:
+
+```bash
+minikube ip     # e.g. 192.168.49.2
+```
+
+Add a hosts entry:
+
+- **Linux/macOS** — `/etc/hosts` (needs sudo):
+  ```
+  192.168.49.2   urlshortener.local
+  ```
+- **Windows** — `C:\Windows\System32\drivers\etc\hosts` (open Notepad as Administrator):
+  ```
+  127.0.0.1   urlshortener.local
+  ```
+
+### 3.3 Reach the Ingress
+
+On Linux/macOS the Minikube IP is routable directly:
+
+```bash
+curl http://urlshortener.local/node/health
+```
+
+On Windows (Docker driver) the node IP is not routable from the host, so port-forward the ingress controller to **port 8080** — this is the setup the k6 test expects:
+
+```bash
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80
+```
+
+Then in another terminal:
+
+```bash
+curl -H "Host: urlshortener.local" http://localhost:8080/node/health
+# → {"status":"healthy"}
+
+curl -H "Host: urlshortener.local" http://localhost:8080/python/
+```
+
+Browser access: add `127.0.0.1 urlshortener.local` to your hosts file and open
+`http://urlshortener.local:8080/python/`.
+
+---
+
+## Deployment — Part 4: Horizontal Pod Autoscaler
+
+Three HPAs are configured — one per application service.
+
+| HPA | Target Deployment | Min | Max | CPU target | Scale-down window |
+|---|---|---|---|---|---|
+| `go-service-hpa` | `go-service` | 1 | 5 | 50% | 60s |
+| `node-service-hpa` | `node-service` | 1 | 5 | 50% | 60s |
+| `python-service-hpa` | `python-service` | 1 | 5 | 50% | 60s |
+
+HPA requires the Metrics Server (enabled in step 2.1) and CPU **requests** on the containers — every deployment in this project sets `requests.cpu: 100m`.
+
+### 4.1 Apply and verify
+
+```bash
+kubectl apply -f kubernetes/hpa.yaml
+kubectl get hpa -n urlshortener
+```
+
+The `TARGETS` column must show a real percentage (e.g. `1%/50%`). If it shows `<unknown>`, the Metrics Server is not ready yet — wait ~60 seconds and re-check:
+
+```bash
+kubectl top pods -n urlshortener
+```
+
+### 4.2 Watch scaling during load
+
+Run this in a separate terminal while the k6 test (Part 6) is running:
+
+```bash
+kubectl get hpa -n urlshortener -w
+kubectl get pods -n urlshortener -w
+```
+
+---
+
+## Deployment — Part 5: Monitoring with Prometheus & Grafana
+
+The `kube-prometheus-stack` Helm chart installs Prometheus, Grafana, Alertmanager and the node/kube-state exporters in one shot.
+
+### 5.1 Install
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+kubectl create namespace monitoring
+
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring
+```
+
+PowerShell single-line version:
+
+```powershell
+helm install monitoring prometheus-community/kube-prometheus-stack --namespace monitoring
+```
+
+### 5.2 Verify
+
+```bash
+kubectl get pods -n monitoring
+kubectl get svc -n monitoring
+```
+
+Wait for all pods to reach `Running`:
+
+```bash
+kubectl wait --for=condition=ready pod --all -n monitoring --timeout=300s
+```
+
+### 5.3 Open Grafana
+
+```bash
+kubectl port-forward -n monitoring svc/monitoring-grafana 3001:80
+```
+
+Open http://localhost:3001
+
+Credentials:
+
+- **Username:** `admin`
+- **Password:** retrieve it with
+
+  ```bash
+  kubectl get secret monitoring-grafana -n monitoring \
+    -o jsonpath="{.data.admin-password}" | base64 -d
+  ```
+
+  PowerShell:
+
+  ```powershell
+  $b = kubectl get secret monitoring-grafana -n monitoring -o jsonpath="{.data.admin-password}"
+  [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b))
+  ```
+
+  (Chart default is `prom-operator`.)
+
+Useful built-in dashboards: **Kubernetes / Compute Resources / Namespace (Pods)** — select namespace `urlshortener` to watch CPU and memory per pod while load testing.
+
+### 5.4 Open Prometheus
+
+```bash
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090
+```
+
+Open http://localhost:9090 and try:
+
+```promql
+sum(rate(container_cpu_usage_seconds_total{namespace="urlshortener"}[2m])) by (pod)
+container_memory_working_set_bytes{namespace="urlshortener"}
+kube_deployment_status_replicas{namespace="urlshortener"}
+```
+
+---
+
+## Deployment — Part 6: Load Testing with k6
+
+[`loadtest.js`](loadtest.js) drives traffic through the Ingress at `localhost:8080` with the `Host: urlshortener.local` header.
+
+```javascript
+export const options = {
+  vus: 50,          // 50 virtual users
+  duration: '30s',  // for 30 seconds
+};
+```
+
+### 6.1 Prerequisites
+
+The ingress port-forward from step 3.3 must be running:
+
+```bash
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80
+```
+
+### 6.2 Install k6
+
+- **Windows:** `winget install k6 --source winget` or `choco install k6`
+- **macOS:** `brew install k6`
+- **Linux:** see https://grafana.com/docs/k6/latest/set-up/install-k6/
+
+Verify: `k6 version` (if "command not found", reopen the terminal so the PATH refreshes).
+
+### 6.3 Run the test
+
+```bash
+k6 run loadtest.js
+```
+
+### 6.4 Results achieved
+
+| Metric | Result |
+|---|---|
+| Virtual users | 50 |
+| Duration | 30s |
+| Total requests | 1500 |
+| Failed requests | 0 (0.00%) |
+| Average response time | ≈ 10–12 ms |
+
+The application served all concurrent requests successfully with no failures.
+
+### 6.5 Observe autoscaling during the run
+
+```bash
+# terminal A
+k6 run loadtest.js
+
+# terminal B
+kubectl get hpa -n urlshortener -w
+
+# terminal C
+kubectl top pods -n urlshortener
+```
+
+> The default script only hits the lightweight `/node/health` endpoint, so CPU stays low and the HPA may not scale. To force scaling, raise `vus` (e.g. 300), remove the `sleep(1)`, or point the request at `/python/` which does more work per request.
+
+---
+
+## CI/CD with GitHub Actions
+
+Workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml)
+
+**Triggers:** every push to `main` and every pull request targeting `main`.
+
+**Job — `build` (ubuntu-latest):**
+
+1. `actions/checkout@v4`
+2. `docker build -t go-service ./go-service`
+3. `docker build -t node-service ./node-service`
+4. `docker build -t python-service ./python-service`
+
+This validates that all three Dockerfiles build cleanly before any change is merged — a broken Dockerfile fails the pipeline instead of the deployment.
+
+Check runs under the repository's **Actions** tab.
+
+### Extending to CD
+
+To push images and deploy automatically, add a job after `build`:
+
+```yaml
+  push:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - run: |
+          docker build -t $DOCKERHUB_USERNAME/go-service:${{ github.sha }} ./go-service
+          docker push $DOCKERHUB_USERNAME/go-service:${{ github.sha }}
+```
+
+Then swap `imagePullPolicy: Never` for a registry image reference in the deployments and run `kubectl set image` (or Argo CD / Flux) against the target cluster.
+
+---
+
+## Verification Checklist
+
+Run these to confirm every part of the assignment:
+
+```bash
+# Docker
+docker compose ps
+
+# Namespace and workloads
+kubectl get all -n urlshortener
+
+# Pods
+kubectl get pods -n urlshortener
+
+# Services
+kubectl get svc -n urlshortener
+
+# ConfigMap and Secret
+kubectl get configmap,secret -n urlshortener
+
+# Ingress
+kubectl get ingress -n urlshortener
+
+# HPA
+kubectl get hpa -n urlshortener
+
+# Metrics
+kubectl top pods -n urlshortener
+
+# Monitoring stack
+kubectl get pods -n monitoring
+
+# Application through the Ingress
+curl -H "Host: urlshortener.local" http://localhost:8080/node/health
+
+# Load test
+k6 run loadtest.js
+```
+
+---
+
+## Cleanup / Teardown
+
+```bash
+# Application resources
+kubectl delete -f kubernetes/
+# or drop the whole namespace (removes everything inside it)
+kubectl delete namespace urlshortener
+
+# Monitoring stack
+helm uninstall monitoring -n monitoring
+kubectl delete namespace monitoring
+
+# Docker Compose
+docker compose down -v
+
+# Whole cluster
+minikube stop
+minikube delete
+```
+
+---
+
+## Troubleshooting
+
+Issues encountered during this assignment and how each was resolved.
+
+**`ErrImageNeverPull` / `ImagePullBackOff`**
+The image is not present inside the Minikube node. Build with `docker compose build`, then `minikube image load <image>:latest` for all three images. Confirm with `minikube image ls | grep urlshortner`. The image name must match the deployment exactly, including the `urlshortner-microservices-` prefix.
+
+**Ingress not reachable / connection refused**
+`minikube addons enable ingress` and wait for `kubectl get pods -n ingress-nginx` to show `Running`. On Windows with the Docker driver the Minikube IP is not routable from the host — use `kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80` and send the `Host: urlshortener.local` header.
+
+**404 from the Ingress**
+The rewrite annotation strips the prefix, so request `/node/health`, not `/node` alone. Requests without the correct `Host` header will not match the rule.
+
+**`HPA TARGETS <unknown>`**
+Metrics Server is missing or still warming up: `minikube addons enable metrics-server`, wait ~60s, then check `kubectl top pods -n urlshortener`. HPA also needs CPU `requests` set on the containers (already configured here).
+
+**Helm install fails / chart not found**
+Run `helm repo add prometheus-community https://prometheus-community.github.io/helm-charts` followed by `helm repo update` before installing.
+
+**Grafana pod stuck in `Init` / login fails**
+The init container waits on the datasource sidecar — give it 2–3 minutes. Fetch the real password from the `monitoring-grafana` secret rather than assuming the default.
+
+**`k6: command not found` after install**
+The installer updated PATH but the current shell has the old environment. Close and reopen the terminal, or run k6 from its install directory.
+
+**Pod `CrashLoopBackOff`**
+Read the logs and events:
+
+```bash
+kubectl logs -n urlshortener <pod-name>
+kubectl logs -n urlshortener <pod-name> --previous
+kubectl describe pod -n urlshortener <pod-name>
+```
+
+**Redis PVC `Pending`**
+Minikube's default storage class must be active: `kubectl get sc`. Check the claim with `kubectl describe pvc redis-pvc -n urlshortener`.
+
+---
+
+## API Reference
+
+### Go Service — port 8000
+
+**Create short URL**
+
+```http
 POST /api/shorten
 Content-Type: application/json
 
-{
-  "long_url": "https://example.com/very/long/url"
-}
+{ "long_url": "https://example.com/very/long/url" }
+```
 
-Response:
+```json
 {
   "short_code": "abc123",
   "short_url": "http://localhost:8000/abc123",
@@ -302,69 +800,33 @@ Response:
 
 **Redirect**
 
-```bash
+```http
 GET /{short_code}
-# Redirects to the long URL and sends event to Python service
 ```
 
-### Python Service (Port 5000)
+Redirects to the long URL and publishes a click event to Redis.
 
-**Dashboard**
+### Python Service — port 5000
 
-```bash
-GET /
-# Returns the web dashboard
-```
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | GET | Web dashboard |
+| `/create` | POST | Create a URL from the UI (`long_url` form field) |
+| `/api/events` | POST | HTTP fallback for click events |
+| `/api/stats` | GET | `total_urls`, `total_clicks`, `top_urls`, `recent_clicks`, `clicks_over_time`, `all_urls` |
 
-**Create URL (from UI)**
+### Node.js Service — port 3000
 
-```bash
-POST /create
-Content-Type: application/x-www-form-urlencoded
+**Fetch metadata**
 
-long_url=https://example.com
-```
-
-**Receive Click Event**
-
-```bash
-POST /api/events
-Content-Type: application/json
-
-{
-  "short_code": "abc123",
-  "clicked_at": "2025-11-08T12:00:00Z"
-}
-```
-
-**Get Statistics**
-
-```bash
-GET /api/stats
-
-Returns JSON with:
-- total_urls
-- total_clicks
-- top_urls (with metadata)
-- recent_clicks
-- clicks_over_time
-- all_urls (with metadata)
-```
-
-### Node.js Service (Port 3000)
-
-**Fetch Metadata**
-
-```bash
+```http
 POST /api/metadata
 Content-Type: application/json
 
-{
-  "short_code": "abc123",
-  "long_url": "https://example.com"
-}
+{ "short_code": "abc123", "long_url": "https://example.com" }
+```
 
-Response:
+```json
 {
   "short_code": "abc123",
   "url": "https://example.com",
@@ -375,23 +837,16 @@ Response:
 }
 ```
 
-**Get Metadata**
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/metadata/{short_code}` | GET | Stored metadata for a short code |
+| `/health` | GET | `{"status":"healthy"}` |
 
-```bash
-GET /api/metadata/{short_code}
-# Returns stored metadata for a short code
-```
-
-**Health Check**
-
-```bash
-GET /health
-# Returns service health status
-```
+---
 
 ## Database Schema
 
-### Go Service (go.db)
+**Go — `go.db`**
 
 ```sql
 CREATE TABLE urls (
@@ -402,7 +857,7 @@ CREATE TABLE urls (
 );
 ```
 
-### Python Service (python.db)
+**Python — `python.db`**
 
 ```sql
 CREATE TABLE click_events (
@@ -424,7 +879,7 @@ CREATE TABLE url_metadata (
 );
 ```
 
-### Node.js Service (node.db)
+**Node.js — `node.db`**
 
 ```sql
 CREATE TABLE metadata (
@@ -438,161 +893,26 @@ CREATE TABLE metadata (
 );
 ```
 
-## Microservice Design Principles Demonstrated
+---
 
-1. **Service Independence**: Each service has its own database and can run independently
-2. **Single Responsibility**: Go=Redirects, Python=Analytics/UI, Node.js=Metadata, Redis=Messaging
-3. **Event-Driven Architecture**: Redis Pub/Sub for decoupled async communication
-4. **API Communication**: Services communicate via REST APIs for synchronous operations
-5. **Service Orchestration**: Python orchestrates calls to both Go and Node.js
-6. **Message Broker**: Redis as central message bus (industry-standard pattern)
-7. **Caching Strategy**: Redis caching layer for performance optimization
-8. **Graceful Degradation**: System works even if Redis or Node.js unavailable
-9. **Data Ownership**: Each service owns and manages its own data
-10. **Scalability**: Services can be scaled independently, Redis enables horizontal scaling
-11. **Containerization**: Each service runs in isolated Docker containers
-12. **Environment Configuration**: Services use environment variables for Docker/local flexibility
-13. **Resilience**: Events never lost - queued in Redis until processed
+## Learning Outcomes
 
-## Testing the System
+- Containerizing polyglot services (Go, Python, Node.js) with per-service Dockerfiles
+- Orchestrating a multi-service stack locally with Docker Compose
+- Writing Kubernetes Deployments, Services, PVCs and Namespaces from scratch
+- Separating configuration (ConfigMap) from secrets (Secret)
+- Routing multiple services behind a single host with Ingress NGINX and rewrite rules
+- Configuring CPU-based autoscaling with HPA and the Metrics Server
+- Installing and using a monitoring stack (Prometheus + Grafana) via Helm
+- Performance testing with k6 and correlating results with cluster metrics
+- Automating build validation with GitHub Actions CI
 
-### Docker Testing
+---
 
-If you're running with Docker:
+## Credits & License
 
-```bash
-# Start services
-docker-compose up --build
+Base application originally authored by [Abdullah Zayed](https://zayedabdullah.com) ([GitHub: xaadu](https://github.com/xaadu)).
 
-# In another terminal, test with curl
-curl -X POST http://localhost:5000/create -d "long_url=https://github.com"
+Kubernetes deployment, Ingress, HPA, monitoring, load testing and CI/CD work by **Mahbuba Sultana Shammi** — Ostad Batch-10, DevOps.
 
-# Watch logs in real-time
-docker-compose logs -f
-
-# View specific service logs
-docker-compose logs go-service
-docker-compose logs python-service
-docker-compose logs node-service
-```
-
-### Test URL Creation and Redirection
-
-```bash
-# Create a short URL
-curl -X POST http://localhost:5000/create \
-  -d "long_url=https://github.com"
-
-# Test redirect (will open in browser)
-curl -L http://localhost:8000/{returned_short_code}
-
-# Check analytics
-curl http://localhost:5000/api/stats
-```
-
-### Verify Microservice Communication
-
-1. Create a URL through the Python dashboard (e.g., https://github.com)
-2. Check Go service logs - you should see the URL creation
-3. Check Node.js service logs - you should see metadata fetching
-4. Check Python service logs - you should see metadata stored
-5. Look at the dashboard - you should see the page title and favicon
-6. Click the short URL
-7. Check Go service logs - you should see the redirect and event sending
-8. Check Python service logs - you should see the click event received
-9. Refresh the dashboard - you should see updated analytics with metadata
-
-**Testing Node.js Service Separately:**
-
-```bash
-# Test metadata fetching directly
-curl -X POST http://localhost:3000/api/metadata \
-  -H "Content-Type: application/json" \
-  -d '{"short_code":"test123","long_url":"https://github.com"}'
-
-# Check health
-curl http://localhost:3000/health
-```
-
-## Project Structure
-
-```
-/home/xaadu/codes/urlshortner/
-├── README.md
-├── docker-compose.yml    # Docker Compose with 4 services (includes Redis!)
-├── go-service/
-│   ├── Dockerfile        # Go container with CGO for SQLite
-│   ├── .dockerignore     # Docker ignore file
-│   ├── main.go           # Go app with Redis pub/sub & caching
-│   ├── go.mod            # Go dependencies (includes go-redis)
-│   ├── go.sum            # Go dependency checksums
-│   └── go.db             # SQLite database (created at runtime)
-├── python-service/
-│   ├── Dockerfile        # Python container
-│   ├── .dockerignore     # Docker ignore file
-│   ├── app.py            # Flask app with Redis subscriber
-│   ├── requirements.txt   # Python deps (Flask, requests, redis)
-│   ├── python.db         # SQLite database (created at runtime)
-│   └── templates/
-│       └── dashboard.html # Web dashboard UI with metadata display
-└── node-service/
-    ├── Dockerfile        # Node.js container
-    ├── .dockerignore     # Docker ignore file
-    ├── server.js         # Express application (metadata fetching)
-    ├── package.json      # Node.js dependencies
-    └── node.db           # SQLite database (created at runtime)
-```
-
-## Technologies Used
-
-- **Go 1.24**: High-performance backend
-  - Gin web framework
-  - SQLite3 driver
-  - Alpine Linux (Docker base)
-- **Python 3.14**: Analytics and UI
-  - Flask web framework
-  - Requests library
-  - SQLite3 (built-in)
-  - Slim Debian (Docker base)
-- **Node.js 24.11**: Metadata service
-  - Express web framework
-  - Axios (HTTP client)
-  - Cheerio (HTML parsing)
-  - SQLite3 driver
-  - Alpine Linux (Docker base)
-- **Redis 7**: Message broker and cache
-  - Pub/Sub for event-driven architecture
-  - Caching layer for performance
-  - Persistence with AOF (Append-Only File)
-- **Docker & Docker Compose**: Containerization and orchestration
-- **SQLite**: Lightweight database for all three services
-- **Chart.js**: Data visualization
-- **Modern CSS**: Responsive dashboard design
-
-## Future Enhancements
-
-- Add Redis for message queue between services
-- Implement rate limiting
-- Add user authentication
-- Support custom short codes
-- Add geographic tracking
-- Implement URL expiration
-- Add bulk URL creation
-- Export analytics reports
-
-## Author
-
-[Abdullah Zayed (zayedabdullah.com)](https://zayedabdullah.com)
-Contact: [Email (contact@zayedabdullah.com)](mailto:contact@zayedabdullah.com) | [GitHub (xaadu)](https://github.com/xaadu) | [LinkedIn (abdullahzayed01)](https://www.linkedin.com/in/abdullahzayed01/)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a pull request.
-
-## Support
-
-If you find this project useful, please consider supporting me with a star or a follow.
-
-## License
-
-MIT License - Free to use for educational purposes
+MIT License — free to use for educational purposes.
