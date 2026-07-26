@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: python-service
+  namespace: urlshortener
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: python-service
+  template:
+    metadata:
+      labels:
+        app: python-service
+    spec:
+      containers:
+        - name: python-service
+          image: urlshortner-microservices-python-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5000
+          env:
+            - name: GO_SERVICE_URL
+              value: "http://go-service:8000"
+            - name: NODE_SERVICE_URL
+              value: "http://node-service:3000"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: python-service
+  namespace: urlshortener
+spec:
+  selector:
+    app: python-service
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP

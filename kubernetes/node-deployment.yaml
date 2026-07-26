@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-service
+  namespace: urlshortener
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-service
+  template:
+    metadata:
+      labels:
+        app: node-service
+    spec:
+      containers:
+      - name: node-service
+        image: urlshortner-microservices-node-service:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-service
+  namespace: urlshortener
+spec:
+  selector:
+    app: node-service
+  ports:
+  - port: 3000
+    targetPort: 3000
+  type: ClusterIP
