@@ -4,7 +4,8 @@ python.db
 node.db
 
 # GO
-go.sum
+# NOTE: go.sum is a lockfile and MUST be committed - the Docker build
+# (COPY go.mod go.sum ./) fails on a fresh CI checkout without it.
 
 # Python
 venv/
